@@ -1,0 +1,15 @@
+Railway → Service → Variables me ye 4 add karo:
+
+BOT_TOKEN= (BotFather se jo token hai - yahan mat public share karna)
+SOURCE_CHAT_ID=-1003415196836
+TARGET_CHAT_ID=-1004389329782
+ADMIN_IDS=8467972004,6312515331
+
+Start command:
+python bot.py
+
+Deploy ke baad Telegram pe:
+/start
+/status
+/test
+/bulk 1 12500
