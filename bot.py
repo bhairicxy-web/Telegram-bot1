@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Forward Bot + Word Block + BULK copy
+Telegram Forward Bot + Word Block + BULK (with word filter)
 """
 
 from __future__ import annotations
@@ -34,6 +34,13 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
+# Railway-friendly extra words: BLOCKED_WORDS=spam,scam,badword
+ENV_WORDS = [
+    w.lower().strip()
+    for w in os.getenv("BLOCKED_WORDS", "").split(",")
+    if w.strip()
+]
+
 WORDS_FILE = Path(__file__).parent / "blocked_words.json"
 
 logging.basicConfig(
@@ -42,7 +49,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("forward-bot")
 
-# Bulk job state (single job at a time)
 bulk_task: asyncio.Task | None = None
 bulk_stop = asyncio.Event()
 bulk_status = {
@@ -53,18 +59,29 @@ bulk_status = {
     "ok": 0,
     "fail": 0,
     "skip": 0,
+    "filtered": 0,
 }
 
 
 def load_words() -> list[str]:
-    if not WORDS_FILE.exists():
-        return []
-    try:
-        data = json.loads(WORDS_FILE.read_text(encoding="utf-8"))
-        return [w.lower().strip() for w in data.get("words", []) if w.strip()]
-    except (json.JSONDecodeError, OSError) as e:
-        logger.error("words read error: %s", e)
-        return []
+    words: list[str] = []
+    if WORDS_FILE.exists():
+        try:
+            data = json.loads(WORDS_FILE.read_text(encoding="utf-8"))
+            words.extend(
+                w.lower().strip() for w in data.get("words", []) if w.strip()
+            )
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error("words read error: %s", e)
+    words.extend(ENV_WORDS)
+    # unique keep order
+    seen: set[str] = set()
+    out: list[str] = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
 
 
 def save_words(words: list[str]) -> None:
@@ -91,47 +108,72 @@ def remove_blocked_words(text: str, words: list[str]) -> str:
     return cleaned.strip()
 
 
+def text_was_filtered(original: str, cleaned: str) -> bool:
+    return (original or "") != (cleaned or "")
+
+
 async def reply(msg: Message, text: str) -> None:
     await msg.reply_text(text)
 
 
 async def send_cleaned_to_target(context: ContextTypes.DEFAULT_TYPE, msg: Message) -> str:
+    """Send msg content to target with word filter. Returns ok|skip_empty."""
     words = load_words()
-    text = msg.text or msg.caption or ""
-    cleaned = remove_blocked_words(text, words)
+    original = msg.text or msg.caption or ""
+    cleaned = remove_blocked_words(original, words)
     has_media = bool(
-        msg.photo or msg.video or msg.document or msg.audio
-        or msg.voice or msg.animation or msg.sticker or msg.video_note
+        msg.photo
+        or msg.video
+        or msg.document
+        or msg.audio
+        or msg.voice
+        or msg.animation
+        or msg.sticker
+        or msg.video_note
     )
     if not cleaned and not has_media:
         return "skip_empty"
 
     if msg.photo:
         await context.bot.send_photo(
-            chat_id=TARGET_CHAT_ID, photo=msg.photo[-1].file_id, caption=cleaned or None
+            chat_id=TARGET_CHAT_ID,
+            photo=msg.photo[-1].file_id,
+            caption=cleaned or None,
         )
     elif msg.video:
         await context.bot.send_video(
-            chat_id=TARGET_CHAT_ID, video=msg.video.file_id, caption=cleaned or None
+            chat_id=TARGET_CHAT_ID,
+            video=msg.video.file_id,
+            caption=cleaned or None,
         )
     elif msg.document:
         await context.bot.send_document(
-            chat_id=TARGET_CHAT_ID, document=msg.document.file_id, caption=cleaned or None
+            chat_id=TARGET_CHAT_ID,
+            document=msg.document.file_id,
+            caption=cleaned or None,
         )
     elif msg.audio:
         await context.bot.send_audio(
-            chat_id=TARGET_CHAT_ID, audio=msg.audio.file_id, caption=cleaned or None
+            chat_id=TARGET_CHAT_ID,
+            audio=msg.audio.file_id,
+            caption=cleaned or None,
         )
     elif msg.voice:
         await context.bot.send_voice(
-            chat_id=TARGET_CHAT_ID, voice=msg.voice.file_id, caption=cleaned or None
+            chat_id=TARGET_CHAT_ID,
+            voice=msg.voice.file_id,
+            caption=cleaned or None,
         )
     elif msg.animation:
         await context.bot.send_animation(
-            chat_id=TARGET_CHAT_ID, animation=msg.animation.file_id, caption=cleaned or None
+            chat_id=TARGET_CHAT_ID,
+            animation=msg.animation.file_id,
+            caption=cleaned or None,
         )
     elif msg.sticker:
-        await context.bot.send_sticker(chat_id=TARGET_CHAT_ID, sticker=msg.sticker.file_id)
+        await context.bot.send_sticker(
+            chat_id=TARGET_CHAT_ID, sticker=msg.sticker.file_id
+        )
     elif msg.video_note:
         await context.bot.send_video_note(
             chat_id=TARGET_CHAT_ID, video_note=msg.video_note.file_id
@@ -140,6 +182,9 @@ async def send_cleaned_to_target(context: ContextTypes.DEFAULT_TYPE, msg: Messag
         await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=cleaned)
     else:
         return "skip_empty"
+
+    if text_was_filtered(original, cleaned):
+        return "ok_filtered"
     return "ok"
 
 
@@ -150,8 +195,8 @@ async def channel_auto_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     try:
         status = await send_cleaned_to_target(context, msg)
-        if status == "ok":
-            logger.info("Auto-forwarded msg %s", msg.message_id)
+        if status.startswith("ok"):
+            logger.info("Auto-forwarded msg %s (%s)", msg.message_id, status)
     except Exception:
         logger.exception("Auto forward failed")
 
@@ -169,15 +214,93 @@ async def manual_forward_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
     try:
         status = await send_cleaned_to_target(context, msg)
-        if status == "ok":
-            await reply(msg, "Done! Hmm pe chala gaya.")
+        if status.startswith("ok"):
+            extra = " (words filtered)" if status == "ok_filtered" else ""
+            await reply(msg, f"Done! Hmm pe chala gaya.{extra}")
         else:
-            await reply(msg, "Empty after filter / no media.")
+            await reply(msg, "Empty after filter / no media — skip.")
     except Exception as e:
         await reply(msg, f"Fail: {e}")
 
 
-# ── BULK COPY (12500+ messages) ─────────────────────────────────────────────
+async def bulk_one_message(context: ContextTypes.DEFAULT_TYPE, mid: int) -> str:
+    """
+    One message bulk with WORD FILTER:
+    1) forward source→target (API returns full Message with text/media)
+    2) delete that forward (so 'Forwarded from' header na rahe)
+    3) re-send cleaned content
+    Returns: ok | ok_filtered | skip | fail
+    """
+    try:
+        # forwardMessage returns full Message — isse text/caption milta hai
+        fwd = await context.bot.forward_message(
+            chat_id=TARGET_CHAT_ID,
+            from_chat_id=SOURCE_CHAT_ID,
+            message_id=mid,
+        )
+    except RetryAfter as e:
+        await asyncio.sleep(int(e.retry_after) + 1)
+        try:
+            fwd = await context.bot.forward_message(
+                chat_id=TARGET_CHAT_ID,
+                from_chat_id=SOURCE_CHAT_ID,
+                message_id=mid,
+            )
+        except TelegramError as e2:
+            err = str(e2).lower()
+            if "not found" in err or "message" in err and "not found" in err:
+                return "skip"
+            return "fail"
+    except TelegramError as e:
+        err = str(e).lower()
+        if "not found" in err or "message to forward not found" in err:
+            return "skip"
+        if "protected" in err:
+            # forward forbidden — try plain copy (no filter)
+            try:
+                await context.bot.copy_message(
+                    chat_id=TARGET_CHAT_ID,
+                    from_chat_id=SOURCE_CHAT_ID,
+                    message_id=mid,
+                )
+                return "ok"
+            except TelegramError:
+                return "fail"
+        return "fail"
+    except Exception:
+        return "fail"
+
+    # Delete the raw forward (header wala)
+    try:
+        await context.bot.delete_message(
+            chat_id=TARGET_CHAT_ID, message_id=fwd.message_id
+        )
+    except TelegramError:
+        # delete fail ho to bhi cleaned dubara bhej denge (duplicate risk)
+        logger.warning("Could not delete temp forward id=%s", fwd.message_id)
+
+    # Re-send with word filter
+    try:
+        status = await send_cleaned_to_target(context, fwd)
+        if status == "skip_empty":
+            return "skip"
+        if status == "ok_filtered":
+            return "ok_filtered"
+        return "ok"
+    except RetryAfter as e:
+        await asyncio.sleep(int(e.retry_after) + 1)
+        try:
+            status = await send_cleaned_to_target(context, fwd)
+            if status == "skip_empty":
+                return "skip"
+            return "ok_filtered" if status == "ok_filtered" else "ok"
+        except Exception:
+            return "fail"
+    except Exception:
+        logger.exception("bulk resend fail id=%s", mid)
+        return "fail"
+
+
 async def run_bulk(
     context: ContextTypes.DEFAULT_TYPE,
     admin_chat_id: int,
@@ -185,7 +308,6 @@ async def run_bulk(
     to_id: int,
     delay: float,
 ) -> None:
-    """Copy message IDs from_id..to_id from SOURCE → TARGET."""
     global bulk_status
     bulk_stop.clear()
     bulk_status.update(
@@ -197,22 +319,31 @@ async def run_bulk(
             "ok": 0,
             "fail": 0,
             "skip": 0,
+            "filtered": 0,
         }
     )
     total = to_id - from_id + 1
-    logger.info("BULK start %s→%s total~%s delay=%s", from_id, to_id, total, delay)
+    words = load_words()
+    logger.info(
+        "BULK+FILTER start %s→%s total~%s delay=%s words=%s",
+        from_id,
+        to_id,
+        total,
+        delay,
+        len(words),
+    )
 
     await context.bot.send_message(
         admin_chat_id,
-        f"BULK START\n"
+        f"BULK START (with WORD BLOCK)\n"
         f"Range: {from_id} → {to_id} (~{total} ids)\n"
-        f"Delay: {delay}s per msg\n"
+        f"Blocked words: {len(words)}\n"
+        f"{', '.join(words[:20]) or '(none — /block se add karo)'}\n"
+        f"Delay: {delay}s\n"
         f"ETA rough: {int(total * delay / 60)}+ min\n\n"
-        f"Progress: /bulkstatus\n"
-        f"Stop: /bulkstop\n\n"
-        f"Note: deleted/missing IDs skip ho jayenge.\n"
-        f"Word-filter bulk copy pe nahi lagta (Telegram limit).\n"
-        f"Sirf copy ho raha hai source → target.",
+        f"/bulkstatus  |  /bulkstop\n\n"
+        f"Har message: filter → Hmm pe clean post\n"
+        f"Missing IDs skip.",
     )
 
     last_progress = 0
@@ -222,42 +353,24 @@ async def run_bulk(
                 break
 
             bulk_status["current"] = mid
-            try:
-                await context.bot.copy_message(
-                    chat_id=TARGET_CHAT_ID,
-                    from_chat_id=SOURCE_CHAT_ID,
-                    message_id=mid,
-                )
-                bulk_status["ok"] += 1
-            except RetryAfter as e:
-                wait = int(e.retry_after) + 1
-                logger.warning("Flood wait %ss at id %s", wait, mid)
-                await asyncio.sleep(wait)
-                try:
-                    await context.bot.copy_message(
-                        chat_id=TARGET_CHAT_ID,
-                        from_chat_id=SOURCE_CHAT_ID,
-                        message_id=mid,
-                    )
-                    bulk_status["ok"] += 1
-                except TelegramError:
-                    bulk_status["skip"] += 1
-            except TelegramError as e:
-                # message not found / deleted / not accessible
-                err = str(e).lower()
-                if "not found" in err or "message to copy not found" in err:
-                    bulk_status["skip"] += 1
-                else:
-                    bulk_status["fail"] += 1
-                    if bulk_status["fail"] <= 5:
-                        logger.warning("bulk id %s: %s", mid, e)
-            except Exception as e:
-                bulk_status["fail"] += 1
-                logger.warning("bulk id %s unexpected: %s", mid, e)
+            result = await bulk_one_message(context, mid)
 
-            # progress every 100 ok+skip+fail or every 100 ids
-            done = bulk_status["ok"] + bulk_status["skip"] + bulk_status["fail"]
-            if done - last_progress >= 100 or mid == to_id:
+            if result == "ok":
+                bulk_status["ok"] += 1
+            elif result == "ok_filtered":
+                bulk_status["ok"] += 1
+                bulk_status["filtered"] += 1
+            elif result == "skip":
+                bulk_status["skip"] += 1
+            else:
+                bulk_status["fail"] += 1
+
+            done = (
+                bulk_status["ok"]
+                + bulk_status["skip"]
+                + bulk_status["fail"]
+            )
+            if done - last_progress >= 50 or mid == to_id:
                 last_progress = done
                 pct = int((mid - from_id + 1) / total * 100)
                 try:
@@ -265,7 +378,9 @@ async def run_bulk(
                         admin_chat_id,
                         f"Progress {pct}%\n"
                         f"ID: {mid}/{to_id}\n"
-                        f"OK: {bulk_status['ok']} | Skip: {bulk_status['skip']} | Fail: {bulk_status['fail']}",
+                        f"OK: {bulk_status['ok']} "
+                        f"(filtered {bulk_status['filtered']})\n"
+                        f"Skip: {bulk_status['skip']} | Fail: {bulk_status['fail']}",
                     )
                 except Exception:
                     pass
@@ -278,19 +393,16 @@ async def run_bulk(
         await context.bot.send_message(
             admin_chat_id,
             f"BULK {'STOPPED' if stopped else 'FINISHED'}\n\n"
-            f"OK copied: {bulk_status['ok']}\n"
-            f"Skip (missing): {bulk_status['skip']}\n"
+            f"OK: {bulk_status['ok']}\n"
+            f"Word-filtered: {bulk_status['filtered']}\n"
+            f"Skip: {bulk_status['skip']}\n"
             f"Fail: {bulk_status['fail']}\n"
             f"Last ID: {bulk_status['current']}",
         )
-        logger.info("BULK done status=%s", bulk_status)
+        logger.info("BULK done %s", bulk_status)
 
 
 async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /bulk 1 12500
-    /bulk 1 12500 0.15
-    """
     global bulk_task
     msg = update.effective_message
     user = update.effective_user
@@ -311,32 +423,26 @@ async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args or len(context.args) < 2:
         await reply(
             msg,
-            "12500 messages bulk copy:\n\n"
+            "BULK + WORD BLOCK\n\n"
             "Usage:\n"
             "/bulk FROM_ID TO_ID\n"
             "/bulk FROM_ID TO_ID DELAY\n\n"
             "Example:\n"
-            "/bulk 1 13361\n"
-            "/bulk 1 13361 0.2\n\n"
-            "Message ID kaise pata karein?\n"
-            "Source post open karo → Share link\n"
-            "Link: t.me/c/XXXX/13361 → ID = 13361\n"
-            "Pehla post ID usually 1+ se start\n\n"
-            "DELAY default 0.12 sec (flood se bachne ke liye)\n"
-            "12500 x 0.12s ≈ 25 minutes+\n\n"
-            "/bulkstatus - progress\n"
-            "/bulkstop - band karo\n\n"
-            "IMPORTANT:\n"
-            "- Bulk = seedha COPY (word block nahi)\n"
-            "- Word block sirf naye posts + manual forward pe\n"
-            "- Beech ke deleted IDs skip",
+            "/bulk 1 100\n"
+            "/bulk 1 12500 0.25\n\n"
+            "Message ID: post link t.me/c/xxxx/ID\n\n"
+            "Words: /listblocks  |  /block word\n"
+            "Railway pe permanent words ke liye variable:\n"
+            "BLOCKED_WORDS=spam,scam,fraud\n\n"
+            "/bulkstatus  /bulkstop\n"
+            "Default delay 0.2s (filter mode thoda slower)",
         )
         return
 
     try:
         from_id = int(context.args[0])
         to_id = int(context.args[1])
-        delay = float(context.args[2]) if len(context.args) >= 3 else 0.12
+        delay = float(context.args[2]) if len(context.args) >= 3 else 0.2
     except ValueError:
         await reply(msg, "IDs numbers hone chahiye. Example: /bulk 1 12500")
         return
@@ -345,18 +451,20 @@ async def cmd_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(msg, "FROM >= 1 aur TO >= FROM hona chahiye.")
         return
     if to_id - from_id > 200000:
-        await reply(msg, "Range bahut badi hai (max 200000 ids ek job me).")
+        await reply(msg, "Range bahut badi (max 200000).")
         return
-    if delay < 0.05:
-        delay = 0.05
-    if delay > 5:
-        delay = 5
+    delay = min(max(delay, 0.08), 5.0)
 
     bulk_stop.clear()
     bulk_task = asyncio.create_task(
         run_bulk(context, user.id, from_id, to_id, delay)
     )
-    await reply(msg, f"Bulk job start: {from_id} → {to_id}. /bulkstatus se dekho.")
+    await reply(
+        msg,
+        f"Bulk+Filter start: {from_id} → {to_id}\n"
+        f"Words loaded: {len(load_words())}\n"
+        f"/bulkstatus se dekho.",
+    )
 
 
 async def cmd_bulkstop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -370,7 +478,7 @@ async def cmd_bulkstop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await reply(msg, "Koi bulk job nahi chal rahi.")
         return
     bulk_stop.set()
-    await reply(msg, "Stop signal bhej diya — thodi der me ruk jayegi.")
+    await reply(msg, "Stop signal — thodi der me rukegi.")
 
 
 async def cmd_bulkstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -382,16 +490,19 @@ async def cmd_bulkstatus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     s = bulk_status
     if not s["running"] and s["ok"] == 0 and s["current"] == 0:
-        await reply(msg, "Abhi koi bulk job nahi / pehle nahi chali.")
+        await reply(msg, "Abhi koi bulk job nahi.")
         return
     total = max(1, s["to_id"] - s["from_id"] + 1)
-    pct = int((s["current"] - s["from_id"] + 1) / total * 100) if s["to_id"] else 0
+    pct = (
+        int((s["current"] - s["from_id"] + 1) / total * 100) if s["to_id"] else 0
+    )
     await reply(
         msg,
         f"Bulk {'RUNNING' if s['running'] else 'IDLE'}\n"
         f"Range: {s['from_id']} → {s['to_id']}\n"
-        f"Current ID: {s['current']} ({pct}%)\n"
-        f"OK: {s['ok']} | Skip: {s['skip']} | Fail: {s['fail']}",
+        f"Current: {s['current']} ({pct}%)\n"
+        f"OK: {s['ok']} (word-filtered: {s.get('filtered', 0)})\n"
+        f"Skip: {s['skip']} | Fail: {s['fail']}",
     )
 
 
@@ -403,19 +514,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply(
         msg,
         "Forward Bot + Word Block + BULK\n\n"
-        "=== 12500 PURANE MESSAGES ===\n"
-        "/bulk 1 13361\n"
-        "(apne last message ID ke hisaab se TO_ID badlo)\n\n"
-        "/bulkstatus - progress\n"
-        "/bulkstop - stop\n\n"
-        "Message ID: post ka link t.me/c/xxxx/ID\n\n"
-        "=== Naye posts ===\n"
-        "Source pe auto forward + word block\n\n"
-        "=== Ek purana post + word block ===\n"
-        "Post → Forward → @Forwardbyrbot\n\n"
-        "Other:\n"
-        "/status /test /block /listblocks /copy ID\n\n"
-        f"Admin: {'YES' if user and is_admin(user.id) else 'NO'}",
+        "=== BULK (purane + word block) ===\n"
+        "/bulk 1 12500\n"
+        "/bulkstatus | /bulkstop\n\n"
+        "=== Words ===\n"
+        "/block word | /unblock word\n"
+        "/listblocks\n\n"
+        "=== Naye posts === auto + word block\n"
+        "=== Ek post === Forward → is bot pe\n\n"
+        f"/status /test\n"
+        f"Admin: {'YES' if user and is_admin(user.id) else 'NO'}\n"
+        f"Words now: {len(load_words())}",
     )
 
 
@@ -441,6 +550,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_copy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Single ID with word filter (same as bulk one)."""
     msg = update.effective_message
     user = update.effective_user
     if not msg:
@@ -449,16 +559,20 @@ async def cmd_copy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(msg, "Sirf admin.")
         return
     if not context.args or not context.args[0].isdigit():
-        await reply(msg, "Usage: /copy 36")
+        await reply(msg, "Usage: /copy 36  (word filter ke saath)")
         return
     mid = int(context.args[0])
-    try:
-        await context.bot.copy_message(
-            chat_id=TARGET_CHAT_ID, from_chat_id=SOURCE_CHAT_ID, message_id=mid
+    result = await bulk_one_message(context, mid)
+    if result in ("ok", "ok_filtered"):
+        await reply(
+            msg,
+            f"Copied {mid}"
+            + (" (filtered)" if result == "ok_filtered" else ""),
         )
-        await reply(msg, f"Copied {mid}")
-    except Exception as e:
-        await reply(msg, f"Fail: {e}")
+    elif result == "skip":
+        await reply(msg, f"Skip {mid} (not found / empty after filter)")
+    else:
+        await reply(msg, f"Fail {mid}")
 
 
 async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -472,13 +586,31 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await reply(msg, "Usage: /block word")
         return
     word = " ".join(context.args).strip().lower()
-    words = load_words()
-    if word in words:
+    # save only file words (not env); merge display via load_words
+    file_words: list[str] = []
+    if WORDS_FILE.exists():
+        try:
+            file_words = [
+                w.lower().strip()
+                for w in json.loads(
+                    WORDS_FILE.read_text(encoding="utf-8")
+                ).get("words", [])
+                if w.strip()
+            ]
+        except (json.JSONDecodeError, OSError):
+            file_words = []
+    if word in file_words or word in ENV_WORDS:
         await reply(msg, "Pehle se blocked.")
         return
-    words.append(word)
-    save_words(words)
-    await reply(msg, f"Blocked: {word}")
+    file_words.append(word)
+    save_words(file_words)
+    await reply(
+        msg,
+        f"Blocked: {word}\n"
+        f"Total now: {len(load_words())}\n"
+        f"Note: Railway pe /block restart pe reset ho sakta hai.\n"
+        f"Permanent: Variables me BLOCKED_WORDS=word1,word2",
+    )
 
 
 async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -492,115 +624,17 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await reply(msg, "Usage: /unblock word")
         return
     word = " ".join(context.args).strip().lower()
-    words = load_words()
-    if word not in words:
-        await reply(msg, "List me nahi.")
-        return
-    save_words([w for w in words if w != word])
-    await reply(msg, f"Unblocked: {word}")
-
-
-async def cmd_listblocks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await reply(msg, "Sirf admin.")
-        return
-    words = load_words()
-    await reply(msg, "Blocked:\n" + ("\n".join(f"- {w}" for w in words) if words else "(empty)"))
-
-
-async def cmd_clearblocks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await reply(msg, "Sirf admin.")
-        return
-    save_words([])
-    await reply(msg, "Cleared.")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-    if not is_admin(update.effective_user.id if update.effective_user else None):
-        await reply(msg, "Sirf admin.")
-        return
-    src = tgt = "?"
-    try:
-        src = (await context.bot.get_chat(SOURCE_CHAT_ID)).title or "?"
-    except Exception as e:
-        src = f"ERR {e}"
-    try:
-        tgt = (await context.bot.get_chat(TARGET_CHAT_ID)).title or "?"
-    except Exception as e:
-        tgt = f"ERR {e}"
-    await reply(
-        msg,
-        f"Source: {src}\nTarget: {tgt}\n"
-        f"Blocked words: {len(load_words())}\n"
-        f"Bulk running: {bulk_status['running']}\n"
-        f"12500 ke liye: /bulk 1 LAST_ID",
-    )
-
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Handler error: %s", context.error)
-
-
-def main() -> None:
-    if not BOT_TOKEN or not SOURCE_CHAT_ID or not TARGET_CHAT_ID:
-        raise SystemExit("Config missing")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_error_handler(on_error)
-
-    for cmd, fn in [
-        ("start", cmd_start),
-        ("help", cmd_help),
-        ("test", cmd_test),
-        ("copy", cmd_copy),
-        ("bulk", cmd_bulk),
-        ("bulkstop", cmd_bulkstop),
-        ("bulkstatus", cmd_bulkstatus),
-        ("block", cmd_block),
-        ("unblock", cmd_unblock),
-        ("listblocks", cmd_listblocks),
-        ("clearblocks", cmd_clearblocks),
-        ("status", cmd_status),
-    ]:
-        app.add_handler(CommandHandler(cmd, fn))
-
-    app.add_handler(
-        MessageHandler(
-            filters.Chat(chat_id=SOURCE_CHAT_ID) & ~filters.COMMAND,
-            channel_auto_handler,
+    if word in ENV_WORDS:
+        await reply(
+            msg,
+            f"'{word}' ENV (BLOCKED_WORDS) se aaya hai — "
+            f"Railway Variables se hatao.",
         )
-    )
-    app.add_handler(
-        MessageHandler(
-            filters.UpdateType.CHANNEL_POST & ~filters.COMMAND,
-            channel_auto_handler,
-        ),
-        group=1,
-    )
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & ~filters.COMMAND,
-            manual_forward_handler,
-        ),
-        group=2,
-    )
-
-    logger.info("Bot starting bulk-enabled source=%s target=%s", SOURCE_CHAT_ID, TARGET_CHAT_ID)
-    app.run_polling(
-        allowed_updates=["message", "channel_post", "edited_channel_post", "edited_message"],
-        drop_pending_updates=False,
-    )
-
-
-if __name__ == "__main__":
-    main()
+        return
+    file_words: list[str] = []
+    if WORDS_FILE.exists():
+        try:
+            file_words = [
+                w.lower().strip()
+                for w in json.loads(
+                    WORDS_FILE.read_text(encoding="utf-8")
