@@ -1,5 +1,0 @@
-# Railway/Railpack build fix
-# Error: mise python@3.12.6 -> "No GitHub artifact attestations found"
-# Isse attestation verification band ho jati hai aur build pass ho jata hai.
-[settings]
-python.github_attestations = false
