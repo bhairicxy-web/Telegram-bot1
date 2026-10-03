@@ -1,0 +1,42 @@
+{
+  "remove": [],
+  "replace": {
+    "@zcyt_2026": "@RicxyBhai",
+    "zcyt_2026": "RicxyBhai",
+    "@ZCYT_2026": "@RicxyBhai"
+  },
+  "caption": {
+    "header": "",
+    "footer": "Owner 👤 : @RicxyBhai",
+    "replace_all": "",
+    "template": "",
+    "remove_original": false,
+    "use_template_always": true
+  },
+  "buttons": [
+    [
+      {
+        "text": "Contact Us",
+        "url": "https://t.me/RicxyBhai"
+      }
+    ]
+  ],
+  "targets": [
+    -1003928071905
+  ],
+  "source_id": -1003415196836,
+  "settings": {
+    "skip_number": 0,
+    "last_from": 1,
+    "last_to": 0,
+    "last_current": 0,
+    "delay": 0.35,
+    "skip_duplicates": false,
+    "awaiting": "",
+    "auto_forward": false,
+    "quote_auto": true,
+    "quote_min_lines": 3,
+    "preview_until": 0
+  },
+  "targets_only": true
+}
